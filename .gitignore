@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 作業用
+tmp/
+*.json.out
+scan-*.json
+.ruff_cache/

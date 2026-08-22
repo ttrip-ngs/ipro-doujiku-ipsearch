@@ -1,0 +1,8 @@
+# 標準ライブラリのみの単一ファイルツール。
+# UP (pyupgrade) は %-format の書き換えが 59 箇所に及び、動作実績のある
+# コードを機械的に書き換える利点が無いため外している。
+target-version = "py38"
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "I", "B", "SIM"]
