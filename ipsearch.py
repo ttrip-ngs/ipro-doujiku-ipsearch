@@ -314,7 +314,8 @@ def list_interfaces():
     """インターフェース一覧を返す。
 
     各要素は {"name", "mac", "inet":[(addr, mask_int)], "status", "flags"}。
-    status は "active"(リンクアップ) / "inactive" に正規化する。
+    status は "active"(リンクアップ) / "inactive"(リンクなし) /
+    "down"(管理上ダウン。Linux のみ) に正規化する。
     """
     if IS_LINUX:
         return _list_interfaces_linux()
@@ -347,6 +348,21 @@ def _list_interfaces_darwin():
     return ifaces
 
 
+def _run_ip(args):
+    """iproute2 の `ip` を実行して CompletedProcess を返す。
+
+    最小構成の Debian には iproute2 が入っていないことがある。素のまま
+    subprocess に渡すと FileNotFoundError の traceback で終わり、現地の
+    作業者に「何を入れれば動くのか」が伝わらないため、ここで説明して落とす。
+    """
+    try:
+        return subprocess.run(["ip"] + args, capture_output=True, text=True)
+    except FileNotFoundError:
+        sys.exit("エラー: ip コマンド (iproute2) が見つかりません。\n"
+                 "  sudo apt-get install -y iproute2\n"
+                 "を実行してから再試行してください。")
+
+
 def _prefix_to_mask(prefix):
     prefix = int(prefix)
     if prefix == 0:
@@ -358,12 +374,13 @@ def _list_interfaces_linux():
     """iproute2 の `ip -o link` / `ip -o -4 addr` から一覧を組み立てる。
 
     status は link/ether を持つ物理系で LOWER_UP フラグ(キャリア検出)が
-    立っていれば "active"、無ければ "inactive" とし、macOS の
-    "status: active" と意味を揃える。
+    立っていれば "active" とし、macOS の "status: active" と意味を揃える。
+    LOWER_UP が無い場合、UP (管理上アップ) があれば "inactive" (ケーブル未接続)、
+    無ければ "down" (ip link set up がされていない) と区別する。**この2つは
+    現地での対処が全く違う** (前者はケーブル、後者はコマンド1つ) ため分ける。
     """
     ifaces = {}
-    link = subprocess.run(["ip", "-o", "link", "show"],
-                          capture_output=True, text=True).stdout
+    link = _run_ip(["-o", "link", "show"]).stdout
     for line in link.splitlines():
         # 例: "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 ...
         #      link/ether 00:0a:85:18:01:12 brd ff:ff:ff:ff:ff:ff"
@@ -379,12 +396,16 @@ def _list_interfaces_linux():
         em = re.search(r"link/ether\s+([0-9a-fA-F:]{17})", line)
         if em:
             mac = em.group(1).lower()
-        status = "active" if "LOWER_UP" in flags else "inactive"
+        if "LOWER_UP" in flags:
+            status = "active"
+        elif "UP" in flags:
+            status = "inactive"
+        else:
+            status = "down"
         ifaces[name] = {"name": name, "flags": flags, "mac": mac,
                         "inet": [], "status": status}
 
-    addr = subprocess.run(["ip", "-o", "-4", "addr", "show"],
-                          capture_output=True, text=True).stdout
+    addr = _run_ip(["-o", "-4", "addr", "show"]).stdout
     for line in addr.splitlines():
         # 例: "2: eth0    inet 172.31.16.110/24 brd 172.31.16.255 scope global eth0"
         m = re.search(r"^\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)", line)
@@ -406,8 +427,7 @@ def get_interface(name):
 
 def default_route_iface():
     if IS_LINUX:
-        out = subprocess.run(["ip", "route", "show", "default"],
-                             capture_output=True, text=True).stdout
+        out = _run_ip(["route", "show", "default"]).stdout
         m = re.search(r"\bdev\s+(\S+)", out)
         return m.group(1) if m else None
     out = subprocess.run(["route", "-n", "get", "default"],
@@ -724,7 +744,8 @@ class TempAlias:
         else:
             cmd = ["ifconfig", self.ifname, "alias", addr,
                    "netmask", "255.255.255.0"]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = (_run_ip(cmd[1:]) if IS_LINUX
+             else subprocess.run(cmd, capture_output=True, text=True))
         if r.returncode != 0:
             print("  注意: %s への一時 IP %s の付与に失敗しました: %s"
                   % (self.ifname, addr, (r.stderr or "").strip()))
@@ -740,7 +761,8 @@ class TempAlias:
                        "dev", self.ifname]
             else:
                 cmd = ["ifconfig", self.ifname, "-alias", self.addr]
-            subprocess.run(cmd, capture_output=True)
+            with contextlib.suppress(OSError):
+                subprocess.run(cmd, capture_output=True)
             self.addr = None
         return False
 
@@ -807,6 +829,14 @@ def resolve_iface(args):
         if i["mac"] is None:
             sys.exit("エラー: %s は MAC を持たない(イーサネットでない)"
                      "インターフェースです。" % args.interface)
+        if i["status"] == "down":
+            # AF_PACKET の bind() は管理上ダウンの IF でも成功を返すが、カーネルは
+            # prot hook を登録しない。そのまま進むと待ち受けは無言で 0 件になり、
+            # 送信で初めて ENETDOWN の traceback が出る。ここで止めた方が早い。
+            sys.exit("エラー: %s は管理上ダウンです (ip link の UP フラグなし)。\n"
+                     "  sudo ip link set %s up\n"
+                     "を実行してから再試行してください。"
+                     % (args.interface, args.interface))
         return i
 
     cands = [i for i in candidate_interfaces() if i["status"] == "active"]
@@ -1323,6 +1353,16 @@ def main():
         return args.func(args)
     except PermissionError as e:
         sys.exit("エラー: %s" % e)
+    except OSError as e:
+        # AF_PACKET の bind() は管理上ダウンの IF でも成功するため、最初の
+        # 送信まで ENETDOWN が出ない。素の traceback だと原因に辿り着けない。
+        hint = {
+            errno.ENETDOWN: "インターフェースが down しています"
+                            " (sudo ip link set <IF> up)",
+            errno.ENODEV: "指定したインターフェースが存在しません",
+            errno.ENOENT: "必要なコマンドかデバイスが見つかりません",
+        }.get(e.errno)
+        sys.exit("エラー: %s%s" % (e, "\n  → %s" % hint if hint else ""))
     except KeyboardInterrupt:
         sys.stderr.write("\n中断しました。\n")
         return 130
