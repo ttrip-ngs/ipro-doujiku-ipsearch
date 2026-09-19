@@ -2,18 +2,21 @@
 
 対象機種: **WJ-PR204UX** (レシーバー側4ch) / WJ-PR201UX / WJ-PC200UX
 
-設定用 IP を見失った i-PRO 同軸-LANコンバーターを、Mac と直結したまま
-ARP スイープ / パッシブ待ち受けで探し出す単一ファイルの CLI ツール。
-外部ライブラリ不要 (macOS + python3 標準ライブラリのみ)。
+設定用 IP を見失った i-PRO 同軸-LANコンバーターを、PC (Mac / Linux) と
+直結したまま ARP スイープ / パッシブ待ち受けで探し出す単一ファイルの CLI ツール。
+外部ライブラリ不要 (macOS / Linux + python3 標準ライブラリのみ)。
+
+インターフェース名は環境で読み替える (macOS は `en5` 等、Linux は `eth0` 等)。
+以下の例は Linux の `eth0` で記載する。
 
 ## クイックスタート
 
 ```sh
-# 1. 機器と Mac を Ethernet で 1 対 1 直結し、インターフェース名を確認
+# 1. 機器と PC を Ethernet で 1 対 1 直結し、インターフェース名を確認
 python3 ipsearch.py ifaces
 
 # 2. おまかせ実行 (待ち受け -> 段階的スイープ -> HTTP 同定)
-sudo python3 ipsearch.py auto -i en5
+sudo python3 ipsearch.py auto -i eth0
 ```
 
 見つかった IP・設定画面の URL・既定の認証情報 (`WJ-PR204` / `999999`) と、
@@ -51,9 +54,25 @@ IP を合わせずに発見できる。応答したホストには HTTP を投�
 
 ## 動作条件
 
-- macOS 専用 (BPF `/dev/bpfN` を直接叩いている)
+- macOS / Linux 対応。L2 の生フレーム送受信をプラットフォームで切り替える
+  - macOS : BPF (`/dev/bpfN`) を直接使用
+  - Linux : AF_PACKET raw socket を使用 (OpenBlocks IoT DX1 等の機器上でも動作。VLAN サブIF も可)
 - Python 3.8+ (システム標準の `python3` でよい。**外部ライブラリ不要**)
-- raw パケット送受信のため **sudo 必須**
+- Linux では `ip` コマンド (iproute2) を使う (インターフェース列挙・一時 IP 付与)
+- raw パケット送受信のため **sudo / root 必須**
+
+### 注意: 複数 NIC を持つホストでの取りこぼし
+
+対象と**同じサブネットの IP を「別の NIC も」持っている**と、機器を見つけ損ねることがある。
+ARP スイープ自体は `-i` で指定した NIC から raw で送るので効くが、その後の **HTTP に
+よる機種同定**は OS のソケット経由なので、OS のソースアドレス選択・ARP 応答が別 NIC 側に
+偏ると別経路から出てしまい、対象を取りこぼす(応答はしたのに `WJ-PR204` 等として同定
+できない、あるいは 401/200 が返らない)。
+
+実例: Mac に en0(`172.31.16.156`)と en5(`172.31.16.100`)の両方が同一 /24 に居る状態で
+`-i en5` を指定しても、HTTP 判定が en0 経由になり対象コンバーターを取りこぼした。**探索対象の
+セグメントに関わる NIC は 1 つだけ有効**にしてから実行すること(不要な NIC は
+`sudo ifconfig <if> down` / Linux は `sudo ip link set <if> down` で落とす)。
 
 ## 使い方
 
@@ -164,29 +183,38 @@ sudo python3 ipsearch.py verify -i en5 192.168.249.249
 
 ## 見つかった後
 
-1. Mac に、機器と同じサブネットの IP を振る
+1. PC に、機器と同じサブネットの IP を振る
    ```sh
+   # macOS
    sudo ifconfig en5 alias 192.168.249.100 netmask 255.255.255.0
+   # Linux
+   sudo ip addr add 192.168.249.100/24 dev eth0
    ```
-2. `sudo arp -d -a` で ARP テーブルを消す
+2. ARP テーブルを消す (`sudo arp -d -a` / Linux は `sudo ip neigh flush all`)
    (取扱説明書にも、前に繋いだコンバーターの arp エントリが残っていると
    設定画面が開かないことがあると記載されている)
 3. ブラウザで `http://<見つかったIP>/` を開き、`WJ-PR204` / `999999` で認証
 4. `Option` 画面で IP アドレスを確認・変更し、**今度こそ控えておく**
 5. 作業後にエイリアスを外す
    ```sh
+   # macOS
    sudo ifconfig en5 -alias 192.168.249.100
+   # Linux
+   sudo ip addr del 192.168.249.100/24 dev eth0
    ```
 
 ## 見つからないとき
 
 1. `sudo python3 ipsearch.py selftest -i <IPの付いたIF>` が PASS するか。
-   FAIL ならツール側 (BPF) の問題。
+   FAIL ならツール側 (L2 送受信) の問題。
 2. 機器の LAN ランプが緑点灯しているか (オレンジ点灯 = リンクが上がっていない)
 3. `-i` のインターフェース指定が正しいか (`ipsearch.py ifaces` で確認)
 4. `--spa peer` に切り替えて再試行
 5. `--pps 5000 --retries 3` で取りこぼしを減らす
 6. `--ranges all` で RFC1918 全域を掃く
+7. **対象と同じサブネットの IP を別 NIC も持っていないか**を確認する。
+   応答ホストには出るのに機種同定できない (HTTP が返らない/★が付かない) 場合はこれを疑う。
+   探索対象に関わらない NIC は落としてから再実行する (上記「複数 NIC を持つホストでの取りこぼし」参照)
 
 ### ARP スイープの原理的な限界
 

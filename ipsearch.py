@@ -7,15 +7,19 @@
 これらの機種には工場出荷時への初期化(リセット)手段が無い。設定画面(Option)で
 IP アドレスを変更したあとアドレスを忘れると Web UI に到達できなくなる。
 
-本ツールは機器のネットワーク端子に直結した Mac から ARP スイープを行う。ARP は
+本ツールは機器のネットワーク端子に直結した PC から ARP スイープを行う。ARP は
 L2 のプロトコルなので、こちら側の IP 設定と相手の IP 設定が噛み合っていなくても
 応答が返る。応答したホストに対して HTTP を叩き、認証レルム(WJ-PR204 等)で
 対象機器を同定する。
 
-macOS 専用 (BPF /dev/bpfN を直接使用)。標準ライブラリのみ。sudo 必須。
+macOS / Linux 対応。L2 の生フレーム送受信はプラットフォームごとに実装を切り替える。
+  - macOS : BPF (/dev/bpfN) を直接使用
+  - Linux : AF_PACKET raw socket を使用 (OpenBlocks IoT DX1 等の機器上でも動く)
+標準ライブラリのみ。root 権限 (sudo) 必須。
 """
 
 import argparse
+import contextlib
 import ctypes
 import errno
 import fcntl
@@ -25,6 +29,7 @@ import os
 import re
 import select
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -34,7 +39,15 @@ import urllib.error
 import urllib.request
 
 # ---------------------------------------------------------------------------
-# BPF (macOS /dev/bpfN)
+# プラットフォーム判定
+# ---------------------------------------------------------------------------
+
+IS_DARWIN = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+
+
+# ---------------------------------------------------------------------------
+# L2 バックエンド (macOS): BPF (/dev/bpfN)
 # ---------------------------------------------------------------------------
 
 BIOCGBLEN = 0x40044266
@@ -161,10 +174,155 @@ class Bpf:
 
 
 # ---------------------------------------------------------------------------
-# インターフェース情報 (ifconfig をパースする)
+# L2 バックエンド (Linux): AF_PACKET raw socket
+# ---------------------------------------------------------------------------
+
+# setsockopt 用の定数 (Python の socket モジュールに無い環境でも動くよう直書き)
+ETH_P_ALL = 0x0003
+SOL_PACKET = 263
+PACKET_ADD_MEMBERSHIP = 1
+PACKET_DROP_MEMBERSHIP = 2
+PACKET_MR_PROMISC = 1
+SO_ATTACH_FILTER = 26
+PACKET_OUTGOING = getattr(socket, "PACKET_OUTGOING", 4)
+# 自分の送出フレームをカーネル側で受信キューに積ませない (macOS の BIOCSSEESENT=0
+# 相当)。Linux 4.20+ で有効。古いカーネルでは設定が失敗するので suppress する。
+PACKET_IGNORE_OUTGOING = getattr(socket, "PACKET_IGNORE_OUTGOING", 23)
+
+
+class LinuxL2:
+    """AF_PACKET raw socket で生イーサネットフレームを送受信する。
+
+    公開 API は Bpf と同一 (send / read_frames / close)。呼び出し側は
+    L2Socket 経由でどちらのバックエンドかを意識せず使える。
+    """
+
+    def __init__(self, ifname, promisc=True, bufsize=4 * 1024 * 1024,
+                 read_timeout_ms=200, bpf_filter=None):
+        self.ifname = ifname
+        self._mreq = None
+        self._filt_buf = None  # sock_filter 本体を GC から守る
+        self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                                  socket.htons(ETH_P_ALL))
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, bufsize)
+            # フィルタは bind の前に付ける。bind 後に流入する不要フレームを
+            # 取りこぼしなく絞れる (BPF_FILTER_ARP_IP は BSD と同一 opcode)。
+            if bpf_filter:
+                self._attach_filter(bpf_filter)
+            self.sock.bind((ifname, 0))
+            # 自己エコーをカーネルで止める。高 pps スイープを非力な機器で回すと
+            # 2 万本/秒の自己フレームで RX バッファが溢れ、本命の ARP reply が
+            # ドロップされ得る。userspace の PACKET_OUTGOING 破棄は保険として残す。
+            with contextlib.suppress(OSError):
+                self.sock.setsockopt(SOL_PACKET, PACKET_IGNORE_OUTGOING, 1)
+            if promisc:
+                self._set_promisc()
+            self.sock.setblocking(False)
+            # socket 生成〜bind の窓で他インターフェースから積まれたフレームを
+            # 捨てる (bind 前は ETH_P_ALL が全 IF を拾うため、無関係セグメントの
+            # ホストが偽陽性で混入するのを防ぐ)。
+            self._drain()
+        except Exception:
+            self.sock.close()
+            raise
+
+    def _drain(self):
+        while True:
+            try:
+                self.sock.recvfrom(65535)
+            except OSError:
+                break
+
+    def _attach_filter(self, insns):
+        blob = b"".join(struct.pack("HBBI", *i) for i in insns)
+        self._filt_buf = ctypes.create_string_buffer(blob, len(blob))
+        # struct sock_fprog { unsigned short len; struct sock_filter *filter; }
+        # 64bit ではポインタが 8byte 境界に整列するため @HP を使う
+        fprog = struct.pack("@HP", len(insns),
+                            ctypes.addressof(self._filt_buf))
+        self.sock.setsockopt(socket.SOL_SOCKET, SO_ATTACH_FILTER, fprog)
+
+    def _set_promisc(self):
+        ifindex = socket.if_nametoindex(self.ifname)
+        # struct packet_mreq { int mr_ifindex; unsigned short mr_type;
+        #                      unsigned short mr_alen; unsigned char mr_address[8]; }
+        self._mreq = struct.pack("IHH8s", ifindex, PACKET_MR_PROMISC, 0, b"")
+        self.sock.setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP, self._mreq)
+
+    def send(self, frame):
+        """フレームを 1 本送る。カーネルバッファ溢れは待って再送する。"""
+        while True:
+            try:
+                self.sock.send(frame)
+                return
+            except OSError as e:
+                if e.errno in (errno.ENOBUFS, errno.EAGAIN):
+                    time.sleep(0.001)
+                    continue
+                raise
+
+    def read_frames(self, timeout=0.2):
+        """受信済みフレームを list で返す。タイムアウト時は空 list。
+
+        AF_PACKET は自分が送出したフレームも受信するため、pkttype が
+        PACKET_OUTGOING のものは捨てる (BSD の BIOCSSEESENT=0 相当)。
+        """
+        r, _, _ = select.select([self.sock], [], [], timeout)
+        if not r:
+            return []
+        frames = []
+        while True:
+            try:
+                frame, ainfo = self.sock.recvfrom(65535)
+            except OSError as e:
+                if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                    break
+                raise
+            if not frame:
+                break
+            # ainfo = (ifname, proto, pkttype, hatype, addr)
+            if ainfo[2] == PACKET_OUTGOING:
+                continue
+            frames.append(frame)
+        return frames
+
+    def close(self):
+        if self.sock is not None:
+            if self._mreq is not None:
+                with contextlib.suppress(OSError):
+                    self.sock.setsockopt(SOL_PACKET, PACKET_DROP_MEMBERSHIP,
+                                         self._mreq)
+            self.sock.close()
+            self.sock = None
+
+
+# 使用するバックエンドをプラットフォームで選ぶ
+if IS_DARWIN:
+    L2Socket = Bpf
+elif IS_LINUX:
+    L2Socket = LinuxL2
+else:
+    L2Socket = None
+
+
+# ---------------------------------------------------------------------------
+# インターフェース情報 (macOS: ifconfig / Linux: ip コマンド)
 # ---------------------------------------------------------------------------
 
 def list_interfaces():
+    """インターフェース一覧を返す。
+
+    各要素は {"name", "mac", "inet":[(addr, mask_int)], "status", "flags"}。
+    status は "active"(リンクアップ) / "inactive"(リンクなし) /
+    "down"(管理上ダウン。Linux のみ) に正規化する。
+    """
+    if IS_LINUX:
+        return _list_interfaces_linux()
+    return _list_interfaces_darwin()
+
+
+def _list_interfaces_darwin():
     out = subprocess.run(["ifconfig", "-a"], capture_output=True,
                          text=True).stdout
     ifaces, cur = [], None
@@ -190,6 +348,76 @@ def list_interfaces():
     return ifaces
 
 
+def _run_ip(args):
+    """iproute2 の `ip` を実行して CompletedProcess を返す。
+
+    最小構成の Debian には iproute2 が入っていないことがある。素のまま
+    subprocess に渡すと FileNotFoundError の traceback で終わり、現地の
+    作業者に「何を入れれば動くのか」が伝わらないため、ここで説明して落とす。
+    """
+    try:
+        return subprocess.run(["ip"] + args, capture_output=True, text=True)
+    except FileNotFoundError:
+        sys.exit("エラー: ip コマンド (iproute2) が見つかりません。\n"
+                 "  sudo apt-get install -y iproute2\n"
+                 "を実行してから再試行してください。")
+
+
+def _prefix_to_mask(prefix):
+    prefix = int(prefix)
+    if prefix == 0:
+        return 0
+    return (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+
+
+def _list_interfaces_linux():
+    """iproute2 の `ip -o link` / `ip -o -4 addr` から一覧を組み立てる。
+
+    status は link/ether を持つ物理系で LOWER_UP フラグ(キャリア検出)が
+    立っていれば "active" とし、macOS の "status: active" と意味を揃える。
+    LOWER_UP が無い場合、UP (管理上アップ) があれば "inactive" (ケーブル未接続)、
+    無ければ "down" (ip link set up がされていない) と区別する。**この2つは
+    現地での対処が全く違う** (前者はケーブル、後者はコマンド1つ) ため分ける。
+    """
+    ifaces = {}
+    link = _run_ip(["-o", "link", "show"]).stdout
+    for line in link.splitlines():
+        # 例: "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 ...
+        #      link/ether 00:0a:85:18:01:12 brd ff:ff:ff:ff:ff:ff"
+        m = re.match(r"^\d+:\s+([^:@]+)[:@]", line)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        flags = []
+        fm = re.search(r"<([^>]*)>", line)
+        if fm:
+            flags = fm.group(1).split(",")
+        mac = None
+        em = re.search(r"link/ether\s+([0-9a-fA-F:]{17})", line)
+        if em:
+            mac = em.group(1).lower()
+        if "LOWER_UP" in flags:
+            status = "active"
+        elif "UP" in flags:
+            status = "inactive"
+        else:
+            status = "down"
+        ifaces[name] = {"name": name, "flags": flags, "mac": mac,
+                        "inet": [], "status": status}
+
+    addr = _run_ip(["-o", "-4", "addr", "show"]).stdout
+    for line in addr.splitlines():
+        # 例: "2: eth0    inet 172.31.16.110/24 brd 172.31.16.255 scope global eth0"
+        m = re.search(r"^\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)", line)
+        if not m:
+            continue
+        name, ip, prefix = m.group(1), m.group(2), m.group(3)
+        if name in ifaces:
+            ifaces[name]["inet"].append((ip, _prefix_to_mask(prefix)))
+
+    return list(ifaces.values())
+
+
 def get_interface(name):
     for i in list_interfaces():
         if i["name"] == name:
@@ -198,10 +426,18 @@ def get_interface(name):
 
 
 def default_route_iface():
+    if IS_LINUX:
+        out = _run_ip(["route", "show", "default"]).stdout
+        m = re.search(r"\bdev\s+(\S+)", out)
+        return m.group(1) if m else None
     out = subprocess.run(["route", "-n", "get", "default"],
                          capture_output=True, text=True).stdout
     m = re.search(r"interface:\s+(\S+)", out)
     return m.group(1) if m else None
+
+
+# en0(macOS) / eth0 / eno1 / ens33 / enp3s0(Linux 予測可能名) を物理候補とみなす
+_PHYS_IFACE_RE = re.compile(r"^(en|eth|eno|ens|enp)[0-9a-z]*$")
 
 
 def candidate_interfaces():
@@ -210,7 +446,7 @@ def candidate_interfaces():
     for i in list_interfaces():
         if i["mac"] is None:
             continue
-        if not re.match(r"^(en|eth)\d+$", i["name"]):
+        if not _PHYS_IFACE_RE.match(i["name"]):
             continue
         res.append(i)
     return res
@@ -503,9 +739,13 @@ class TempAlias:
         base = t & 0xFFFFFF00
         host = base | (0xFE if (t & 0xFF) != 0xFE else 0xFD)
         addr = str(ipaddress.IPv4Address(host))
-        r = subprocess.run(["ifconfig", self.ifname, "alias", addr,
-                            "netmask", "255.255.255.0"],
-                           capture_output=True, text=True)
+        if IS_LINUX:
+            cmd = ["ip", "addr", "add", "%s/24" % addr, "dev", self.ifname]
+        else:
+            cmd = ["ifconfig", self.ifname, "alias", addr,
+                   "netmask", "255.255.255.0"]
+        r = (_run_ip(cmd[1:]) if IS_LINUX
+             else subprocess.run(cmd, capture_output=True, text=True))
         if r.returncode != 0:
             print("  注意: %s への一時 IP %s の付与に失敗しました: %s"
                   % (self.ifname, addr, (r.stderr or "").strip()))
@@ -516,8 +756,13 @@ class TempAlias:
 
     def __exit__(self, *exc):
         if self.addr:
-            subprocess.run(["ifconfig", self.ifname, "-alias", self.addr],
-                           capture_output=True)
+            if IS_LINUX:
+                cmd = ["ip", "addr", "del", "%s/24" % self.addr,
+                       "dev", self.ifname]
+            else:
+                cmd = ["ifconfig", self.ifname, "-alias", self.addr]
+            with contextlib.suppress(OSError):
+                subprocess.run(cmd, capture_output=True)
             self.addr = None
         return False
 
@@ -584,6 +829,14 @@ def resolve_iface(args):
         if i["mac"] is None:
             sys.exit("エラー: %s は MAC を持たない(イーサネットでない)"
                      "インターフェースです。" % args.interface)
+        if i["status"] == "down":
+            # AF_PACKET の bind() は管理上ダウンの IF でも成功を返すが、カーネルは
+            # prot hook を登録しない。そのまま進むと待ち受けは無言で 0 件になり、
+            # 送信で初めて ENETDOWN の traceback が出る。ここで止めた方が早い。
+            sys.exit("エラー: %s は管理上ダウンです (ip link の UP フラグなし)。\n"
+                     "  sudo ip link set %s up\n"
+                     "を実行してから再試行してください。"
+                     % (args.interface, args.interface))
         return i
 
     cands = [i for i in candidate_interfaces() if i["status"] == "active"]
@@ -688,7 +941,7 @@ def passive_listen(iface, seconds, mac_filter=None, prefill=None,
             return {}
     print()
 
-    bpf = Bpf(iface["name"], promisc=True)
+    bpf = L2Socket(iface["name"], promisc=True)
     sw = ArpSweeper(bpf, mac_to_bytes(iface["mac"]), mac_filter=mac_filter)
     if prefill:
         sw.found.update(prefill)
@@ -721,7 +974,7 @@ def cmd_sniff(args):
 
 def sweep_once(iface, nets, args, spa_mode, fixed, prefill=None):
     """1 レンジ分の ARP スイープ。fd は必ず閉じる。"""
-    bpf = Bpf(iface["name"], promisc=True, bpf_filter=BPF_FILTER_ARP_IP)
+    bpf = L2Socket(iface["name"], promisc=True, bpf_filter=BPF_FILTER_ARP_IP)
     sw = ArpSweeper(bpf, mac_to_bytes(iface["mac"]), spa_mode=spa_mode,
                     fixed_spa=fixed, pps=args.pps, retries=args.retries,
                     mac_filter=args.mac)
@@ -772,13 +1025,19 @@ def cmd_selftest(args):
         ("spa=peer は同一/24", f[28:32] == b"\x0a\x01\x02\x01"),
         ("tpa", f[38:42] == b"\x0a\x01\x02\x03"),
         ("spa=probe は 0.0.0.0", spa_for(1, "probe", None) == b"\x00" * 4),
-        ("struct timeval = 16B", struct.calcsize("@qi4x") == 16),
-        ("struct bpf_program = 16B", struct.calcsize("@IQ") == 16),
-        ("struct bpf_insn = 8B", struct.calcsize("@HBBI") == 8),
+        ("sock_filter/bpf_insn = 8B", struct.calcsize("@HBBI") == 8),
     ]
-    pkt = bytes(range(60))
-    rec = struct.pack("@iiIIH", 1, 2, 60, 60, 20) + b"\x00" * 2 + pkt
-    checks.append(("BPF レコード解析", list(Bpf._parse(rec * 2)) == [pkt, pkt]))
+    if IS_DARWIN:
+        checks.append(("struct timeval = 16B", struct.calcsize("@qi4x") == 16))
+        checks.append(("struct bpf_program = 16B", struct.calcsize("@IQ") == 16))
+        pkt = bytes(range(60))
+        rec = struct.pack("@iiIIH", 1, 2, 60, 60, 20) + b"\x00" * 2 + pkt
+        checks.append(("BPF レコード解析",
+                       list(Bpf._parse(rec * 2)) == [pkt, pkt]))
+    elif IS_LINUX:
+        checks.append(("sock_fprog サイズ",
+                       struct.calcsize("@HP") in (8, 16)))
+        checks.append(("packet_mreq = 16B", struct.calcsize("IHH8s") == 16))
     ng = 0
     for name, cond in checks:
         print("  %s %s" % ("OK  " if cond else "NG  ", name))
@@ -788,7 +1047,7 @@ def cmd_selftest(args):
         return 1
 
     print()
-    print("=== 2. 実機検証 (BPF 送受信) ===")
+    print("=== 2. 実機検証 (L2 送受信) ===")
     require_root()
     iface = resolve_iface(args)
     if not iface["inet"]:
@@ -805,7 +1064,7 @@ def cmd_selftest(args):
           % (iface["name"], net))
     print("  自分以外に 1 台でも応答すれば BPF の送受信は正常です。")
     print()
-    bpf = Bpf(iface["name"], promisc=True, bpf_filter=BPF_FILTER_ARP_IP)
+    bpf = L2Socket(iface["name"], promisc=True, bpf_filter=BPF_FILTER_ARP_IP)
     sw = ArpSweeper(bpf, mac_to_bytes(iface["mac"]), spa_mode="probe",
                     pps=1000, retries=2)
     try:
@@ -884,7 +1143,7 @@ def report(found, iface, args):
         print("  1. ツール自体が動いているか")
         print("     sudo python3 ipsearch.py selftest -i <IPの付いたIF>")
         print("     ここが FAIL ならツール側の問題です。")
-        print("  2. Mac と機器が Ethernet ケーブルで直結されているか")
+        print("  2. PC と機器が Ethernet ケーブルで直結されているか")
         print("     (機器の LAN ランプが緑点灯なら L2 リンクは上がっています。"
               "オレンジ点灯はリンクなし)")
         print("  3. -i で正しいインターフェースを指定しているか (ifaces で確認)")
@@ -954,12 +1213,18 @@ def report(found, iface, args):
             pc = ipaddress.IPv4Address(int(net.network_address) | 0xFE)
             if str(pc) == h["ip"]:
                 pc = ipaddress.IPv4Address(int(net.network_address) | 0xFD)
-            print("  %d. Mac の %s に %s/24 を追加して同一サブネットに入る"
-                  % (step, ifname or "直結ポート", pc))
-            print("     sudo ifconfig %s alias %s netmask 255.255.255.0"
-                  % (ifname or "<インターフェース>", pc))
-            print("     (作業後に外す: sudo ifconfig %s -alias %s)"
-                  % (ifname or "<インターフェース>", pc))
+            ifn = ifname or "<インターフェース>"
+            print("  %d. %s に %s/24 を追加して同一サブネットに入る"
+                  % (step, ifn, pc))
+            if IS_LINUX:
+                print("     sudo ip addr add %s/24 dev %s" % (pc, ifn))
+                print("     (作業後に外す: sudo ip addr del %s/24 dev %s)"
+                      % (pc, ifn))
+            else:
+                print("     sudo ifconfig %s alias %s netmask 255.255.255.0"
+                      % (ifn, pc))
+                print("     (作業後に外す: sudo ifconfig %s -alias %s)"
+                      % (ifn, pc))
             step += 1
         print("  %d. ブラウザで %s を開く" % (step, url))
         step += 1
@@ -969,8 +1234,10 @@ def report(found, iface, args):
         print("  %d. Option 画面で IP アドレスを控える"
               "(または使いたい値に変更してメモする)" % step)
         print()
-        print("  ※ 設定画面が開かない場合は sudo arp -d -a で ARP テーブルを"
-              "消してから再試行してください。")
+        arp_flush = ("sudo ip neigh flush all" if IS_LINUX
+                     else "sudo arp -d -a")
+        print("  ※ 設定画面が開かない場合は %s で ARP テーブルを"
+              "消してから再試行してください。" % arp_flush)
     else:
         print("i-PRO 同軸-LANコンバーターとして同定できたホストはありません。")
         print("上記の応答ホストを 1 つずつブラウザで開いて確認してください。")
@@ -992,19 +1259,27 @@ def build_parser():
         description="i-PRO 同軸-LANコンバーター(WJ-PR204UX 等)の IP を探す",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
-使用例:
+使用例 (インターフェース名は macOS なら en5、Linux なら eth0 等):
   sudo ./ipsearch.py ifaces
-  sudo ./ipsearch.py auto -i en5
-  sudo ./ipsearch.py scan -i en5 --ranges common
-  sudo ./ipsearch.py scan -i en5 --ranges 10.0.0.0/8 --pps 30000
-  sudo ./ipsearch.py sniff -i en5 --seconds 30
+  sudo ./ipsearch.py auto -i eth0
+  sudo ./ipsearch.py scan -i eth0 --ranges common
+  sudo ./ipsearch.py scan -i eth0 --ranges 10.0.0.0/8 --pps 30000
+  sudo ./ipsearch.py sniff -i eth0 --seconds 30
+
+注意 (複数 NIC を持つホスト):
+  対象と同じサブネットの IP を「別の NIC も」持っていると、OS のソース
+  アドレス選択・ARP 応答がそちらに偏り、HTTP 同定を取りこぼすことがある
+  (ARP スイープ自体は -i の NIC から raw で出るので効くが、機種判定でズレる)。
+  探索対象のセグメントに関わる NIC は 1 つだけ有効にするのが確実。
 """)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp, need_iface=True):
         if need_iface:
             sp.add_argument("-i", "--interface",
-                            help="機器と直結しているインターフェース (例 en5)")
+                            help="機器と直結しているインターフェース (例 en5 / eth0)。"
+                                 "対象と同じサブネットの IP を別 NIC も持つ環境では、"
+                                 "その別 NIC を無効化してから指定すること (下部の注意参照)")
         sp.add_argument("--mac",
                         help="機器の MAC が分かっている場合の絞り込み")
         sp.add_argument("--port", type=int, default=80,
@@ -1069,14 +1344,25 @@ def build_parser():
 
 
 def main():
-    if sys.platform != "darwin":
-        sys.exit("エラー: 本ツールは macOS 専用です (BPF を直接使用します)。")
+    if L2Socket is None:
+        sys.exit("エラー: 本ツールは macOS または Linux でのみ動作します "
+                 "(現在のプラットフォーム: %s)。" % sys.platform)
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     args = build_parser().parse_args()
     try:
         return args.func(args)
     except PermissionError as e:
         sys.exit("エラー: %s" % e)
+    except OSError as e:
+        # AF_PACKET の bind() は管理上ダウンの IF でも成功するため、最初の
+        # 送信まで ENETDOWN が出ない。素の traceback だと原因に辿り着けない。
+        hint = {
+            errno.ENETDOWN: "インターフェースが down しています"
+                            " (sudo ip link set <IF> up)",
+            errno.ENODEV: "指定したインターフェースが存在しません",
+            errno.ENOENT: "必要なコマンドかデバイスが見つかりません",
+        }.get(e.errno)
+        sys.exit("エラー: %s%s" % (e, "\n  → %s" % hint if hint else ""))
     except KeyboardInterrupt:
         sys.stderr.write("\n中断しました。\n")
         return 130
